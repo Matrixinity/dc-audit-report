@@ -49,6 +49,34 @@ For quick spot checks on specific SKUs, one box per ticket.
   longer than a page. Tick *Start each ticket on a new page* for the old one-per-page
   layout. No signature lines on ticket sheets.
 
+## Freshdesk (added v2.2)
+Each ticket box has **⬇️ Pull from Freshdesk**. Type the ticket number (or paste the
+ticket link, e.g. `https://askhaven.freshdesk.com/a/tickets/17948`) and click it:
+- **Ticket #** becomes the bare number.
+- **Ticket comments** get the ticket subject and description.
+- **SKU search** gets whatever it can spot in the text: the product after "units of …"
+  (up to " at "), anything after `Batch:`, and any Metrc tag (24 chars starting `1A4`).
+  Check it before printing; edit freely.
+- Pulled tickets are cached for 5 minutes.
+
+Setup (one time):
+1. Freshdesk → profile picture → **Profile settings** → **View API key**.
+2. Open `.streamlit/secrets.toml` in this folder and replace `PASTE-YOUR-API-KEY-HERE`:
+   ```toml
+   [freshdesk]
+   domain = "askhaven.freshdesk.com"
+   api_key = "your-key"
+   ```
+3. Restart the app. The sidebar shows *Freshdesk connected* when it's working.
+
+`.streamlit/secrets.toml` is git-ignored: **never commit it**. The key has the same
+access as your Freshdesk login. On Streamlit Cloud, put the same block in the app's
+*Settings → Secrets* instead, and keep that app private, since anyone who can open it
+could pull ticket details.
+
+Not built yet: loading all open audit tickets at once (needs a rule for which tickets
+count, e.g. a group, type or tag).
+
 ## Quantities
 - **Active Qty** = `Available Quantity` of packages that are *not* in selling status.
 - **Selling Qty** = `Quantity` of packages whose `Status` is `selling`.

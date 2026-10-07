@@ -1,8 +1,13 @@
 """
-DC Audit Report Generator v2.1
+DC Audit Report Generator v2.2
 Physical audit sheet generator with PDF export for inventory verification
 
 CHANGELOG:
+v2.2 (2026-10-07)
+- "Pull from Freshdesk" button on each ticket: fills the ticket #, comments, and
+  SKU search (product, batch, Metrc tag) from the Freshdesk ticket. API key lives
+  in .streamlit/secrets.toml (git-ignored)
+
 v2.1 (2026-09-29)
 - Added "Ticket Auditing" section (sidebar): one box per ticket with ticket #,
   pasted ticket comments, and SKU / batch / package label search
@@ -32,6 +37,7 @@ import pandas as pd
 import io
 import re
 import difflib
+import requests
 from xml.sax.saxutils import escape as xml_escape
 from reportlab.lib.pagesizes import letter, A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -47,13 +53,13 @@ from datetime import datetime
 
 # Page config
 st.set_page_config(
-    page_title="DC Audit Report v2.1",
+    page_title="DC Audit Report v2.2",
     page_icon="📋",
     layout="wide"
 )
 
 # Version and constants
-VERSION = "2.1"
+VERSION = "2.2"
 
 # Category / batch label for searched SKUs that have no packages in the export
 NOT_IN_EXPORT = "Not in export"
@@ -328,6 +334,146 @@ def count_real_batches(df):
 def has_selling_packages(audit_df):
     """True when the export contains any packages in selling status"""
     return bool((audit_df['Selling_Qty'] != 0).any())
+
+# ============================================================================
+# FRESHDESK FUNCTIONS
+# ============================================================================
+
+# Metrc package tags are 24 characters starting with 1A4
+METRC_TAG_RE = re.compile(r'\b1A4[0-9A-Z]{21}\b', re.IGNORECASE)
+BATCH_RE = re.compile(r'\bBatch(?:\s*(?:#|No\.?|Number))?\s*[:#]\s*([A-Za-z0-9][A-Za-z0-9._\-]*)', re.IGNORECASE)
+# "5 Missing units of Stiiizy - King Louis XIII Pod 1g at Haven Paramount ..."
+# "We are missing 50 units - Cizi - Glitter Bomb Preroll 1g from 9/24 delivery ..."
+PRODUCT_RE = re.compile(
+    r'\bunits?\s*(?:of|[-–:])\s+(.+?)(?:\s+(?:at|from)\s+|\s+Batch\b|\s+Metrc\b|[\r\n]|$)',
+    re.IGNORECASE
+)
+
+def freshdesk_config():
+    """
+    Freshdesk domain and API key from .streamlit/secrets.toml (or Streamlit Cloud secrets)
+
+    Returns:
+        (domain, api_key) or None when not set up
+    """
+    try:
+        section = st.secrets["freshdesk"]
+        domain = str(section.get("domain", "")).strip()
+        api_key = str(section.get("api_key", "")).strip()
+    except Exception:
+        return None
+    if not domain or not api_key or api_key.startswith("PASTE-"):
+        return None
+    domain = re.sub(r'^https?://', '', domain).strip('/')
+    return domain, api_key
+
+def parse_ticket_number(text):
+    """Ticket number from '17948', '#17948' or a full Freshdesk ticket URL"""
+    match = re.search(r'(\d+)\s*/?\s*$', str(text or '').strip())
+    return match.group(1) if match else None
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_freshdesk_ticket(domain, api_key, ticket_number):
+    """
+    Read one ticket from the Freshdesk API (v2)
+
+    Returns:
+        dict with subject / description_text / etc.
+    Raises:
+        RuntimeError with a message suitable for the UI
+    """
+    url = f"https://{domain}/api/v2/tickets/{ticket_number}"
+    try:
+        response = requests.get(url, auth=(api_key, "X"), timeout=15)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Couldn't reach Freshdesk ({e.__class__.__name__}). Check your connection.")
+
+    if response.status_code == 200:
+        return response.json()
+    if response.status_code == 401:
+        raise RuntimeError("Freshdesk rejected the API key. Check it in .streamlit/secrets.toml.")
+    if response.status_code == 403:
+        raise RuntimeError("Your Freshdesk account doesn't have access to this ticket.")
+    if response.status_code == 404:
+        raise RuntimeError(f"Ticket #{ticket_number} wasn't found in Freshdesk.")
+    if response.status_code == 429:
+        wait = response.headers.get('Retry-After', 'a minute')
+        raise RuntimeError(f"Freshdesk rate limit hit. Try again in {wait} seconds.")
+    raise RuntimeError(f"Freshdesk returned an error (HTTP {response.status_code}).")
+
+def ticket_comment_text(ticket):
+    """Subject plus plain-text description, for the Ticket comments box"""
+    subject = str(ticket.get('subject') or '').strip()
+    description = str(ticket.get('description_text') or '').strip()
+    # Collapse the blank-line runs Freshdesk leaves in plain-text descriptions
+    description = re.sub(r'\n\s*\n+', '\n', description)
+    if subject and description and not description.lower().startswith(subject.lower()):
+        return f"{subject}\n{description}"
+    return description or subject
+
+def extract_search_terms(text):
+    """
+    Pull product names, batch numbers and Metrc tags out of ticket text,
+    e.g. "5 Missing units of Stiiizy - King Louis XIII Pod 1g at Haven Paramount
+    Batch: ST-ORG-KLO-G1026-V3P Metrc: 1A406030004FBC9000244991"
+    """
+    terms = []
+
+    def add(term):
+        term = term.strip().strip('.,;:')
+        if term and term.lower() not in [t.lower() for t in terms]:
+            terms.append(term)
+
+    for match in PRODUCT_RE.finditer(text):
+        add(match.group(1))
+    for match in BATCH_RE.finditer(text):
+        add(match.group(1))
+    for match in METRC_TAG_RE.finditer(text):
+        add(match.group(0).upper())
+    return terms
+
+def clean_ticket_ref(ticket_ref):
+    """Ticket # for the sheet: '#17948' -> '17948', a Freshdesk link -> its number"""
+    ref = str(ticket_ref or '').strip()
+    if '/' in ref:
+        ref = parse_ticket_number(ref) or ref
+    return ref.lstrip('#').strip()
+
+def pull_freshdesk_ticket(key):
+    """
+    Button callback: fill a ticket box from Freshdesk.
+
+    Runs before the widgets are drawn, so it may set their values.
+    """
+    status_key = f"{key}_fd_status"
+    config = freshdesk_config()
+    if config is None:
+        st.session_state[status_key] = ('error', "Freshdesk isn't set up. Add your API key to .streamlit/secrets.toml.")
+        return
+
+    ticket_number = parse_ticket_number(st.session_state.get(f"{key}_ref", ''))
+    if not ticket_number:
+        st.session_state[status_key] = ('error', "Enter a ticket number (or paste the ticket link) first.")
+        return
+
+    try:
+        ticket = fetch_freshdesk_ticket(*config, ticket_number)
+    except RuntimeError as e:
+        st.session_state[status_key] = ('error', str(e))
+        return
+
+    comments = ticket_comment_text(ticket)
+    terms = extract_search_terms(comments)
+
+    st.session_state[f"{key}_ref"] = ticket_number
+    st.session_state[f"{key}_comments"] = comments
+    if terms:
+        st.session_state[f"{key}_search"] = "\n".join(terms)
+        st.session_state[status_key] = ('success', f"Pulled ticket #{ticket_number}. "
+                                        "Check the SKU search it filled in.")
+    else:
+        st.session_state[status_key] = ('warning', f"Pulled ticket #{ticket_number}, but couldn't spot a product, "
+                                        "batch or Metrc tag in it. Enter the SKUs yourself.")
 
 # ============================================================================
 # PDF GENERATION FUNCTIONS
@@ -902,11 +1048,30 @@ def render_ticket_card(audit_df, products_df, ticket_id, number, show_selling, c
         info_col, search_col = st.columns(2)
 
         with info_col:
-            ticket_ref = st.text_input(
-                "Ticket # (optional):",
-                help="Printed on the audit sheet header",
-                key=f"{key}_ref"
-            )
+            ref_col, pull_col = st.columns([3, 2], vertical_alignment="bottom")
+            with ref_col:
+                ticket_ref = st.text_input(
+                    "Ticket # or Freshdesk link (optional):",
+                    help="Printed on the audit sheet header",
+                    key=f"{key}_ref"
+                )
+            with pull_col:
+                fd_ready = freshdesk_config() is not None
+                st.button(
+                    "⬇️ Pull from Freshdesk",
+                    key=f"{key}_pull",
+                    on_click=pull_freshdesk_ticket,
+                    args=(key,),
+                    disabled=not fd_ready,
+                    help="Fills the comments and SKU search from the Freshdesk ticket" if fd_ready
+                         else "Add your Freshdesk API key to .streamlit/secrets.toml to turn this on",
+                    use_container_width=True
+                )
+            
+            fd_status = st.session_state.pop(f"{key}_fd_status", None)
+            if fd_status:
+                level, message = fd_status
+                {'success': st.success, 'warning': st.warning, 'error': st.error}[level](message)
             comments = st.text_area(
                 "Ticket comments:",
                 placeholder="Paste the ticket issue here",
@@ -1037,7 +1202,7 @@ def render_ticket_card(audit_df, products_df, ticket_id, number, show_selling, c
 
         return {
             'number': number,
-            'ref': ticket_ref.strip().lstrip('#').strip(),
+            'ref': clean_ticket_ref(ticket_ref),
             'comments': comments.strip(),
             'terms': terms,
             'df': ticket_df,
@@ -1148,6 +1313,12 @@ def main():
         help="Upload the packages CSV export from Distru"
     )
     
+    fd_config = freshdesk_config()
+    if fd_config:
+        st.sidebar.caption(f"🔗 Freshdesk connected: {fd_config[0]}")
+    else:
+        st.sidebar.caption("🔗 Freshdesk not set up (add your API key to `.streamlit/secrets.toml`)")
+    
     st.sidebar.subheader("🗂️ Product List CSV (optional)")
     products_file = st.sidebar.file_uploader(
         "Upload Product List CSV:",
@@ -1231,7 +1402,10 @@ def main():
     # Changelog in sidebar
     with st.sidebar.expander("📋 Version History"):
         st.markdown("""
-        **v2.1** (Current)
+        **v2.2** (Current)
+        - Pull ticket details from Freshdesk
+        
+        **v2.1**
         - Ticket Auditing section (sidebar): multiple tickets, SKU search, comments
         - Zero-qty items listed but unticked by default
         - Selling Qty + Total Qty (Active + Selling) columns
